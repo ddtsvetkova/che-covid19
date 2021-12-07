@@ -1,0 +1,646 @@
+---
+title: |
+  | The Impact of Health Expenditure on COVID-19 mortality
+author: |
+  | Daria Tsvetkova, Ekaterina Polyvanaya, Mariia Ovsyannikova
+  | Danil Islamov, Mikhail Martyanov, Artemii Gorya
+output:
+  html_document
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, comment = NA, warning = FALSE, echo=FALSE, results = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(broom)
+library(AER)
+library(ggplot2)
+library(sandwich)
+library(xlsx)
+library(lmtest)
+library(car)
+library(readxl)
+library(GGally)
+library(corrplot)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(rgeos)
+library(maps)
+library(xtable)
+library(gtable)
+library(scales)
+library(formattable)
+library(stargazer)
+
+# Решение проблемы наложения * (для значимости) на текст
+# в корреляционной матрице:
+# Заново каждый раз, когда library(corrplot)
+# trace(corrplot, edit=TRUE)
+# заменить на 443 строке
+# place_points = function(sig.locs, point) {
+  #text(pos.pNew[, 1][sig.locs], pos.pNew[, 2][sig.locs], 
+      # labels = point, col = pch.col, cex = pch.cex, 
+       #lwd = 2)
+# НА
+#place_points = function(sig.locs, point) {
+      #text(pos.pNew[, 1][sig.locs], (pos.pNew[, 2][sig.locs])+0.25, 
+           #labels = point, col = pch.col, cex = pch.cex, 
+           #lwd = 2)
+```
+
+## Statistical data analysis pt. 1
+
+```{r echo=TRUE}
+# Reading the pre-prepared dataset
+
+all <- read_excel("che_covid19.xlsx")[,2:40] %>% relocate(mortality, .before = `Country Code`)
+all
+```
+
+```{r echo=TRUE}
+# There are some extra variables, but we will not use all of them
+
+to_use <- c("mortality", "che", "beds", "pop65", "popdens", "urban", "dphe", "dghe", "tobacco", "procur", "doctors", "nurses", "beh_stayhome", "beh_socgathering", "beh_distance", "beh_tellsymp", "beh_handwash", "fob_social", "fob_handshake", "fob_stores", "fob_curfew", "perceivedreaction_d", "govtrust_d", "govfact_d", "perceivedeffectiveness_d", "region", "population")
+
+# Selecting columns we plan to use
+
+data <- subset(all, select=to_use)
+data
+```
+
+
+```{r echo=TRUE}
+# Alleviating the problems in the next function caused by "_" in column names
+colnames(data) <- gsub("_", ".", colnames(data))
+
+# Calculating descriptive statistics
+number <- function(x, na.rm = TRUE){return(sum(!is.na(x)))}
+
+stats <- data %>%
+  summarise(across(where(is.numeric), 
+                   list(mean = mean, median = median, sd = sd, min = min, max = max, Q1=~quantile(., probs = 0.25), Q3=~quantile(., probs = 0.75)), 
+                   na.rm = TRUE)) %>% 
+  pivot_longer(everything(), names_to = "name", values_to = "value") %>% 
+  separate(name, c("variable", "statistic"), sep = "_") %>%
+  pivot_wider(names_from = statistic, values_from = value) %>%
+  arrange(variable) %>% 
+  select(variable, mean, sd, min, Q1, median, Q3, max)
+
+# Changing column names back
+colnames(data) <- gsub("\\.", "_", colnames(data))
+data
+
+# Changing variable names to match
+stats$variable <- gsub("\\.", "_", stats$variable)
+
+options(scipen=999) # Disabling scientific notation (e.g., e+01)
+
+# Putting variables in the original order
+stats = na.omit(stats[match(to_use, stats$variable),])
+stats
+```
+
+```{r echo=TRUE}
+round_df <- function(x, digits) {
+    # round all numeric variables
+    # x: data frame 
+    # digits: number of digits to round
+    numeric_columns <- sapply(x, mode) == 'numeric'
+    x[numeric_columns] <-  round(x[numeric_columns], digits)
+    x
+}
+
+# Rounding the numbers
+round_df(stats, 3)
+```
+
+```{r results=TRUE}
+formattable(round_df(stats, 3))
+```
+
+
+```{r}
+# Saving as latex
+# xtable(round_df(stats, 3))
+```
+
+
+```{r echo=TRUE, fig.show='hide'}
+# Computing the correlation matrix for the numeric variables (all except region)
+CorMatrix = cor(data[, !names(data) %in% c("region")] , use = "complete.obs")
+
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+# Matrix of p-values (H0: correlation = 0)
+p.mat <- cor.mtest(data[, !names(data) %in% c("region")])
+
+CorMatrix<-round(CorMatrix,2)
+
+col <- colorRampPalette(c("deeppink", "hotpink", "lightpink", "floralwhite", "darkseagreen1", "darkslategray2", "dodgerblue4"))
+
+# Uncomment and save as png for legibility
+#png(file="corr.png", res=300, width=4500, height=4500)
+corrplot(CorMatrix, method="color", col=col(200),  
+         type="upper", order="original", 
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, # Text label color and rotation
+         # Combine with significance
+         p.mat = p.mat, sig.level = c(0.01, 0.05, 0.1), insig ="label_sig",
+         # Hide correlation coefficient on the principal diagonal
+         diag=FALSE , number.cex=0.9, tl.cex=1, pch.cex=1)
+```
+
+![Correlogram](corr.png)
+
+```{r echo=TRUE, results=TRUE}
+# Exploring region
+theme_set(theme_bw())
+
+data %>% ggplot(aes(y = mortality, x = region)) + 
+  geom_boxplot()
+```
+
+```{r echo=TRUE, fig.show='hide'}
+# Drawing a map
+
+thismap = map_data("world")
+
+all$`Country Name` <- recode(all$`Country Name`, "'Egypt, Arab Rep.' = 'Egypt'; 'United Kingdom' = 'UK'; 'Korea, Rep.' = 'South Korea'; 'Russian Federation' = 'Russia'; 'Slovak Republic' = 'Slovakia'; 'United States' = 'USA'")
+
+# Setting colors
+thismap <- mutate(thismap, fill = ifelse(region %in% all$`Country Name`[all$region == 'Americas'], "#FF7F11", ifelse(region %in% all$`Country Name`[all$region == 'Europe'], "#1446A0", ifelse(region %in% all$`Country Name`[all$region == 'Western Pacific'], "#DB3069", ifelse(region %in% all$`Country Name`[all$region == 'South-East Asia'], "#00AF54", ifelse(region %in% all$`Country Name`[all$region == 'Eastern Mediterranean'], "#F5D547", "white"))))))
+
+# Using scale_fill_identity to set correct colors
+# Uncomment and save as png for legibility
+#png(file="map.png", res=300, width=4500, height=3000)
+ggplot(thismap, aes(long, lat, fill = fill, group=group)) + 
+  geom_polygon(colour="gray") + 
+  scale_fill_identity("WHO Region", guide = "legend", labels = c("South-East Asia", "Europe", "Western Pacific", "Eastern Mediterranean", "Americas", "unavailable")) +
+theme(legend.position = "bottom", legend.key.size = unit(1,"cm"),   legend.title=element_text(size=30), 
+    legend.text=element_text(size=25))
+```
+
+
+![World Map](map.png)
+
+
+
+```{r echo=TRUE, results=TRUE}
+formattable(data %>% group_by(region) %>%
+     summarise(no_rows = length(region)))
+
+# There is too few instances of the three regions, so it makes sense to make an "other" category.
+
+data = data %>% mutate(region = case_when(data$region=="Americas" ~ "Americas", data$region=="Europe" ~ "Europe", TRUE ~ "Other"))
+```
+
+```{r}
+#xtable(data %>% group_by(region) %>%
+     #summarise(no_rows = length(region)))
+```
+
+
+```{r echo=TRUE, results=TRUE}
+# Exploring procur
+data %>% ggplot(aes(y = mortality, x =  as.factor(procur))) + 
+  geom_boxplot() + scale_x_discrete(name = "procur")
+```
+
+
+```{r echo=TRUE, fig.show='hide'}
+# Drawing scatterplots of everything with mortality
+# Uncomment and save as png for legibility
+#png(file="scatter.png", res=300, width=6000, height=8000)
+data %>% dplyr::select(c(1:25, 27)) %>% 
+  gather(-mortality, key = "var", value = "value") %>%
+  ggplot(aes(x = value, y = mortality)) +
+    geom_point() +
+    facet_wrap(~ var, ncol=3, scales = "free", shrink=TRUE) +
+    theme_bw() + 
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text( size = 16, face = "bold" ),
+          legend.position="none",
+          strip.text = element_text(size = 20))
+  
+```
+
+![Scatterplots](scatter.png)
+
+
+## Statistical data analysis pt. 2
+
+```{r echo=TRUE}
+# Doing the same things again with the newly rebuilt dataset
+allnew <- read_excel("che_covid19-new.xlsx")[,2:37] %>% relocate(mortality, .before = `Country Code`)
+# Now when we select countries with no less than 20 respondents in the Global Behaviors and Perceptions survey, there are 96 complete observations
+allnew <- filter(allnew, n >= 20)
+allnew
+```
+
+
+```{r echo=TRUE}
+# There are some extra variables, but we will not use all of them
+
+to_use1 <- c("mortality", "che", "pop65", "popdens", "urban", "dphe", "dghe", "doctors", "nurses", "beh_stayhome", "beh_socgathering", "beh_distance", "beh_tellsymp", "beh_handwash", "fob_social", "fob_handshake", "fob_stores", "fob_curfew", "perceivedreaction_d", "govtrust_d", "govfact_d", "perceivedeffectiveness_d", "region", "population")
+
+# Selecting columns we plan to use
+
+datanew <- subset(allnew, select=to_use1)
+datanew
+```
+
+```{r echo=TRUE}
+# Alleviating the problems in the next function caused by "_" in column names
+colnames(datanew) <- gsub("_", ".", colnames(datanew))
+
+# Calculating descriptive statistics
+number <- function(x, na.rm = TRUE){return(sum(!is.na(x)))}
+
+statsnew <- datanew %>%
+  summarise(across(where(is.numeric), 
+                   list(mean = mean, median = median, sd = sd, min = min, max = max, Q1=~quantile(., probs = 0.25), Q3=~quantile(., probs = 0.75)), 
+                   na.rm = TRUE)) %>% 
+  pivot_longer(everything(), names_to = "name", values_to = "value") %>% 
+  separate(name, c("variable", "statistic"), sep = "_") %>%
+  pivot_wider(names_from = statistic, values_from = value) %>%
+  arrange(variable) %>% 
+  select(variable, mean, sd, min, Q1, median, Q3, max)
+
+# Changing column names back
+colnames(datanew) <- gsub("\\.", "_", colnames(datanew))
+datanew
+
+# Changing variable names to match
+statsnew$variable <- gsub("\\.", "_", statsnew$variable)
+
+options(scipen=999) # Disabling scientific notation (e.g., e+01)
+
+# Putting variables in the original order
+statsnew = na.omit(statsnew[match(to_use1, statsnew$variable),])
+statsnew
+```
+
+```{r echo=TRUE}
+round_df <- function(x, digits) {
+    # round all numeric variables
+    # x: data frame 
+    # digits: number of digits to round
+    numeric_columns <- sapply(x, mode) == 'numeric'
+    x[numeric_columns] <-  round(x[numeric_columns], digits)
+    x
+}
+
+# Rounding the numbers
+round_df(statsnew, 3)
+```
+
+```{r results=TRUE}
+formattable(round_df(statsnew, 3))
+```
+
+
+```{r}
+# Saving as latex
+# xtable(round_df(statsnew, 3))
+```
+
+```{r echo=TRUE, fig.show='hide'}
+# Computing the correlation matrix for the numeric variables (all except region)
+CorMatrix1 = cor(datanew[, !names(datanew) %in% c("region")] , use = "complete.obs")
+
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+# Matrix of p-values (H0: correlation = 0)
+p.mat1 <- cor.mtest(datanew[, !names(datanew) %in% c("region")])
+
+CorMatrix1<-round(CorMatrix1,2)
+
+col <- colorRampPalette(c("deeppink", "hotpink", "lightpink", "floralwhite", "darkseagreen1", "darkslategray2", "dodgerblue4"))
+
+# Uncomment and save as png for legibility
+#png(file="newcorr.png", res=300, width=4500, height=4500)
+corrplot(CorMatrix1, method="color", col=col(200),  
+         type="upper", order="original", 
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, # Text label color and rotation
+         # Combine with significance
+         p.mat = p.mat1, sig.level = c(0.01, 0.05, 0.1), insig ="label_sig",
+         # Hide correlation coefficient on the principal diagonal
+         diag=FALSE , number.cex=0.9, tl.cex=1, pch.cex=1)
+```
+
+![New Correlogram](newcorr.png)
+
+```{r echo=TRUE, results=TRUE}
+formattable(datanew %>% group_by(region) %>%
+     summarise(no_rows = length(region)))
+```
+
+```{r}
+# xtable(datanew %>% group_by(region) %>%
+     # summarise(no_rows = length(region)))
+```
+
+```{r echo=TRUE, results=TRUE}
+# Exploring region
+
+datanew %>% ggplot(aes(y = mortality, x = region)) + 
+  geom_boxplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r echo=TRUE, fig.show='hide'}
+# Drawing scatterplots of everything with mortality
+# Uncomment and save as png for legibility
+#png(file="newscatter.png", res=300, width=6000, height=8000)
+datanew %>% dplyr::select(c(1:22, 24)) %>% 
+  gather(-mortality, key = "var", value = "value") %>%
+  ggplot(aes(x = value, y = mortality)) +
+    geom_point() +
+    facet_wrap(~ var, ncol=3, scales = "free", shrink=TRUE) +
+    theme_bw() + 
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text( size = 16, face = "bold" ),
+          legend.position="none",
+          strip.text = element_text(size = 20))
+```
+
+![New Scatterplots](newscatter.png)
+
+```{r echo=TRUE, fig.show='hide'}
+# Drawing a map
+theme_set(theme_bw())
+
+thismap1 = map_data("world")
+
+allnew
+
+allnew$`Country Name` <- recode(allnew$`Country Name`, "'Egypt, Arab Rep.' = 'Egypt'; 'United Kingdom' = 'UK'; 'Korea, Rep.' = 'South Korea'; 'Russian Federation' = 'Russia'; 'Slovak Republic' = 'Slovakia'; 'United States' = 'USA'; 'Iran, Islamic Rep.' = 'Iran'")
+
+# Setting colors
+thismap1 <- mutate(thismap1, fill = ifelse(region %in% allnew$`Country Name`[allnew$region == 'Americas'], "#FF7F11", ifelse(region %in% allnew$`Country Name`[allnew$region == 'Europe'], "#1446A0", ifelse(region %in% allnew$`Country Name`[allnew$region == 'Western Pacific'], "#DB3069", ifelse(region %in% allnew$`Country Name`[allnew$region == 'South-East Asia'], "#00AF54", ifelse(region %in% allnew$`Country Name`[allnew$region == 'Eastern Mediterranean'], "#F5D547", ifelse(region %in% allnew$`Country Name`[allnew$region == 'Africa'], "magenta", "white")))))))
+
+# Using scale_fill_identity to set correct colors
+# Uncomment and save as png for legibility
+#png(file="newmap (1).png", res=300, width=4500, height=3000)
+ggplot(thismap1, aes(long, lat, fill = fill, group=group)) + 
+  geom_polygon(colour="gray") + 
+  scale_fill_identity("WHO Region", guide = "legend", labels = c("South-East Asia", "Europe", "Western Pacific", "Eastern Mediterranean", "Americas", "Africa", "u/a")) +
+theme(legend.position = "bottom", legend.key.size = unit(1,"cm"),   legend.title=element_text(size=30), 
+    legend.text=element_text(size=25))
+```
+
+![New World Map](newmapp.png)
+
+
+```{r echo=TRUE, results=TRUE}
+# Drawing a scatterplot over a limited range of density for better visibility
+datanew %>% 
+  ggplot(aes(popdens, mortality)) +
+  geom_jitter(width = 0.25, alpha = 0.5) + xlim(0, 1000)
+```
+
+```{r echo=TRUE, results=TRUE}
+# Drawing a scatterplot over a limited range of population for better visibility
+datanew %>% 
+  ggplot(aes(population, mortality)) +
+  geom_jitter(width = 0.25, alpha = 0.5) +  
+  scale_x_continuous(labels = unit_format(unit = "M", scale = 1e-6), limits = c(0, 200000000), name = "population (mln.)")
+```
+
+
+## Multiple regression analysis
+
+```{r echo=TRUE}
+allnew <- read_excel("che_covid19-new.xlsx")[,2:37] %>%
+relocate(mortality, .before = `Country Code`)
+# Now when we select countries with no less than 20 respondents in the Global Behaviors and Perceptions survey, there are 96 complete observations
+allnew <- filter(allnew, n >= 20)
+allnew
+
+# Adding a new variable income level
+incomelvl <- read_excel("incomelvl.xlsx")
+incomelvl
+
+allnew <- merge(x = allnew, y = incomelvl, by = "Country Code", all.x = TRUE) %>%
+relocate(mortality, .before = `Country Code`)
+allnew
+```
+
+
+```{r}
+# There are some extra variables, but we will not use all of them
+
+to_use2 <- c("mortality", "che", "pop65", "popdens", "urban", "dphe", "dghe", "doctors", "nurses", "beh_stayhome", "beh_socgathering", "beh_distance", "beh_tellsymp", "beh_handwash", "fob_social", "fob_handshake", "fob_stores", "fob_curfew", "perceivedreaction_d", "govtrust_d", "govfact_d", "perceivedeffectiveness_d", "region", "population", "incomelvl")
+
+# Selecting columns we plan to use
+
+datanew <- subset(allnew, select=to_use2)
+rownames(datanew) <- NULL
+datanew$incomelvl <- factor(datanew$incomelvl, levels = c("LIC", "LMC", "UMC", "HIC"))
+datanew
+```
+
+```{r echo=TRUE, results=TRUE}
+# Exploring incomelvl
+
+formattable(datanew %>% group_by(incomelvl) %>%
+     summarise(no_rows = length(incomelvl)))
+```
+
+```{r echo=TRUE, results=TRUE}
+datanew %>% ggplot(aes(y = mortality, x = incomelvl)) + 
+  geom_boxplot() 
+```
+
+```{r echo=TRUE, results=TRUE}
+datanew %>% ggplot(aes(y = che, x = incomelvl)) + 
+  geom_boxplot()
+```
+
+```{r}
+# saving to latex: number of observations by category
+# xtable(datanew %>% group_by(incomelvl) %>%
+     # summarise(no_rows = length(incomelvl)))
+```
+
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_1 <- lm(mortality ~ che, data = datanew) 
+
+cov_ols_1 <- vcovHC(reg_ols_1, type = "HC0")
+se_ols_1 <- sqrt(diag(cov_ols_1))
+
+coeftest(reg_ols_1, df = Inf, vcov = cov_ols_1)
+```
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_2 <- lm(mortality ~ che + pop65 + urban + doctors + nurses + dghe + popdens, data = datanew) 
+
+cov_ols_2 <- vcovHC(reg_ols_2, type = "HC0")
+se_ols_2 <- sqrt(diag(cov_ols_2))
+
+coeftest(reg_ols_2, df = Inf, vcov = cov_ols_2)
+```
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_3 <- lm(mortality ~ che + pop65 + urban + doctors + nurses + dghe + popdens + region, data = datanew) 
+
+cov_ols_3 <- vcovHC(reg_ols_3, type = "HC0")
+se_ols_3 <- sqrt(diag(cov_ols_3))
+
+coeftest(reg_ols_3, df = Inf, vcov = cov_ols_3)
+```
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_4 <- lm(mortality ~ che + pop65 + urban + doctors + nurses + dghe + popdens + region + beh_stayhome + beh_socgathering + beh_distance + beh_tellsymp + beh_handwash + fob_curfew, data = datanew) 
+
+cov_ols_4 <- vcovHC(reg_ols_4, type = "HC0")
+se_ols_4 <- sqrt(diag(cov_ols_4))
+
+coeftest(reg_ols_4, df = Inf, vcov = cov_ols_4)
+```
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_5 <- lm(mortality ~ che + pop65 + urban + doctors + nurses + dghe + popdens + region + beh_stayhome + beh_socgathering + beh_distance + beh_tellsymp + beh_handwash + fob_curfew + incomelvl + che*incomelvl, data = datanew)
+
+cov_ols_5 <- vcovHC(reg_ols_5, type = "HC0")
+se_ols_5 <- sqrt(diag(cov_ols_5))
+
+coeftest(reg_ols_5, df = Inf, vcov = cov_ols_5)
+```
+
+
+```{r echo=TRUE}
+# Exporting to latex
+stargazer(reg_ols_1, reg_ols_2, reg_ols_3, reg_ols_4, reg_ols_5,
+          se = list(se_ols_1, se_ols_2, se_ols_3, se_ols_4, se_ols_5), 
+          title = "Regression results (n=96)",
+          omit = "Constant",
+          keep.stat = "n",
+          notes = "Robust standard errors in parentheses",
+          type = 'latex')
+```
+
+```{r}
+stargazer(reg_ols_1, reg_ols_2, reg_ols_3, reg_ols_4, reg_ols_5,
+          se = list(se_ols_1, se_ols_2, se_ols_3, se_ols_4, se_ols_5), 
+          title = "Regression results",
+          omit = "Constant",
+          keep.stat = "n",
+          notes = "Robust standard errors in parentheses",
+          type = 'html')
+```
+
+```{r echo=TRUE}
+# Regressions (1)-(3) on a larger sample
+many <- read_excel("che_covid19-new.xlsx")[,2:37] %>%
+relocate(mortality, .before = `Country Code`)
+many
+```
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_11 <- lm(mortality ~ che, data = many) 
+
+cov_ols_11 <- vcovHC(reg_ols_11, type = "HC0")
+se_ols_11 <- sqrt(diag(cov_ols_11))
+
+coeftest(reg_ols_11, df = Inf, vcov = cov_ols_11)
+```
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_22 <- lm(mortality ~ che + pop65 + urban + doctors + nurses + dghe + popdens, data = many) 
+
+cov_ols_22 <- vcovHC(reg_ols_22, type = "HC0")
+se_ols_22 <- sqrt(diag(cov_ols_22))
+
+coeftest(reg_ols_22, df = Inf, vcov = cov_ols_22)
+```
+
+```{r echo=TRUE, results=TRUE}
+reg_ols_33 <- lm(mortality ~ che + pop65 + urban + doctors + nurses + dghe + popdens + region, data = many) 
+
+cov_ols_33 <- vcovHC(reg_ols_33, type = "HC0")
+se_ols_33 <- sqrt(diag(cov_ols_33))
+
+coeftest(reg_ols_33, df = Inf, vcov = cov_ols_33)
+```
+
+```{r}
+stargazer(reg_ols_11, reg_ols_22, reg_ols_33,
+          se = list(se_ols_11, se_ols_22, se_ols_33), 
+          title = "Regression results",
+          omit = "Constant",
+          keep.stat = "n",
+          notes = "Robust standard errors in parentheses",
+          type = 'text')
+```
+
+```{r echo=TRUE}
+# Exporting to latex
+stargazer(reg_ols_11, reg_ols_22, reg_ols_33,
+          se = list(se_ols_11, se_ols_22, se_ols_33), 
+          title = "Regression results (n=160)",
+          omit = "Constant",
+          keep.stat = "n",
+          notes = "Robust standard errors in parentheses",
+          type = 'latex')
+```
+
+```{r}
+stargazer(reg_ols_11, reg_ols_22, reg_ols_33,
+          se = list(se_ols_11, se_ols_22, se_ols_33), 
+          title = "Regression results (n=160)",
+          omit = "Constant",
+          keep.stat = "n",
+          notes = "Robust standard errors in parentheses",
+          type = 'html')
+```
+
+## Hypothesis tests
+
+```{r echo=TRUE, results=TRUE}
+car::linearHypothesis(reg_ols_5, "che + che:incomelvlLMC = 0", test="Chisq", white.adjust="hc0")
+```
+
+```{r echo=TRUE, results=TRUE}
+car::linearHypothesis(reg_ols_5, "che + che:incomelvlUMC = 0", test="Chisq", white.adjust="hc0")
+```
+
+```{r echo=TRUE, results=TRUE}
+car::linearHypothesis(reg_ols_5, "che + che:incomelvlHIC = 0", test="Chisq", white.adjust="hc0")
+```
+
+
+
+
+
